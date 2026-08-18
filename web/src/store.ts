@@ -1,0 +1,476 @@
+import { useSyncExternalStore } from 'preact/compat';
+
+export interface Market {
+  symbol: string;
+  display: string;
+  lastQuote: number;
+  lastEpoch: number;
+  lastDigit: number;
+  fresh: boolean;
+  ticksPerMin: number;
+  recentDigits: number[];
+  dist: number[];
+}
+
+export interface SessionInfo {
+  loginid: string;
+  balance: number;
+  currency: string;
+  mode: 'demo' | 'real';
+  auth_kind?: string;
+}
+
+export interface Recovery {
+  mode: 'base' | 'recovering';
+  streak: number;
+  lost: number;
+  last_win_epoch: number;
+  updated_at: number;
+}
+
+export interface Settings {
+  base_stake: number;
+  max_stake: number;
+  martingale_steps: number;
+  max_consecutive_losses: number;
+  daily_loss_limit: number;
+  min_edge: number;
+  min_recovery_win: number;
+  barrier_preference: string;
+  strategy_mode: 'conservative' | 'martingale' | 'boosted_martingale';
+  strategy_multiplier: number;
+}
+
+export interface TradeRow {
+  id: number;
+  ts: number;
+  market: string;
+  contract_type: 'DIGITOVER' | 'DIGITUNDER';
+  barrier: number;
+  duration: number;
+  duration_unit: string;
+  stake: number;
+  ask_price: number;
+  payout: number;
+  est_win: number;
+  profit: number;
+  status: 'pending' | 'won' | 'lost' | 'push' | 'expired' | 'timeout' | 'error';
+  contract_id: string;
+  purchase_id: string;
+  reason: string;
+  resolved_at: number;
+  entry_spot?: number;
+  exit_spot?: number;
+  exit_digit?: number;
+}
+
+export interface FeedStatus {
+  connected: boolean;
+  markets?: number;
+  error?: string;
+  lastActivity?: number;
+}
+
+export interface SignalCandidate {
+  market: string;
+  direction: 'over' | 'under';
+  barrier: number;
+  winRate: number;
+  edge: number;
+  reason?: string;
+}
+
+export interface Decision {
+  direction: 'over' | 'under';
+  barrier: number;
+  stake: number;
+  estWin: number;
+  reason: string;
+}
+
+export interface LogEntry {
+  ts: number;
+  level: string;
+  message: string;
+}
+
+export interface AutomationState {
+  running: boolean;
+  phase: string;
+  lastCompletedAt: number;
+  runTarget?: number;
+  runTrades?: number;
+}
+
+export interface QuoteEvt {
+  market?: string;
+  direction?: string;
+  barrier?: number;
+  ask?: number;
+  payout?: number;
+  estWin?: number;
+}
+
+export interface ContractEvt {
+  contractId?: string;
+  result?: string;
+  profit?: number;
+  phase?: string;
+  error?: string;
+}
+
+export interface State {
+  ws: 'connecting' | 'open' | 'closed';
+  feed: FeedStatus | null;
+  markets: Market[];
+  session: SessionInfo | null;
+  recovery: Recovery | null;
+  settings: Settings | null;
+  automation: AutomationState | null;
+  trades: TradeRow[];
+  selected: string | null;
+  signal: { signal: SignalCandidate; phase: string } | null;
+  quote: QuoteEvt | null;
+  decision: { decision: Decision; streak: number; lost: number } | null;
+  hold: { reason: string } | null;
+  contract: ContractEvt | null;
+  logs: LogEntry[];
+}
+
+const initial: State = {
+  ws: 'connecting',
+  feed: null,
+  markets: [],
+  session: null,
+  recovery: null,
+  settings: null,
+  automation: null,
+  trades: [],
+  selected: null,
+  signal: null,
+  quote: null,
+  decision: null,
+  hold: null,
+  contract: null,
+  logs: [],
+};
+
+let state: State = initial;
+const listeners = new Set<() => void>();
+
+function set(patch: Partial<State>): void {
+  state = { ...state, ...patch };
+  for (const cb of listeners) cb();
+}
+
+function pushLog(level: string, message: string): void {
+  const logs = [...state.logs.slice(-49), { ts: Date.now(), level, message }];
+  set({ logs });
+}
+
+export function useStore(): State {
+  return useSyncExternalStore(
+    (cb) => {
+      listeners.add(cb);
+      return () => listeners.delete(cb);
+    },
+    () => state,
+  );
+}
+
+export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = { ...((init?.headers as Record<string, string>) ?? {}) };
+  if (init?.body != null) headers['Content-Type'] = 'application/json';
+  const res = await fetch(path, { ...init, headers });
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    // non-json response
+  }
+  if (!res.ok) {
+    const msg = (body as { error?: string })?.error ?? `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  return body as T;
+}
+
+function applyEvent(evt: Record<string, unknown>): void {
+  const type = String(evt.type ?? '');
+  const patch: Partial<State> = {};
+  switch (type) {
+    case 'hello': {
+      const markets = (evt.markets as Market[]) ?? [];
+      patch.markets = markets;
+      if (!patch.selected && markets.length) patch.selected = markets[0]?.symbol ?? null;
+      break;
+    }
+    case 'feed':
+      patch.feed = evt.status as FeedStatus;
+      break;
+    case 'tick': {
+      const symbol = String(evt.symbol ?? '');
+      const m: Market = {
+        symbol,
+        display: String(evt.display ?? symbol),
+        lastQuote: Number(evt.quote ?? 0),
+        lastEpoch: Number(evt.epoch ?? 0),
+        lastDigit: Number(evt.digit ?? -1),
+        fresh: Boolean(evt.fresh),
+        ticksPerMin: 0,
+        recentDigits: (evt.recentDigits as number[]) ?? [],
+        dist: [],
+      };
+      const idx = state.markets.findIndex((x) => x.symbol === symbol);
+      const markets = state.markets.slice();
+      if (idx >= 0) {
+        const prev = markets[idx];
+        markets[idx] = {
+          ...prev,
+          ...m,
+          ticksPerMin: m.recentDigits.length >= 2 ? m.recentDigits.length : prev.ticksPerMin,
+          recentDigits: m.recentDigits.length ? m.recentDigits : prev.recentDigits,
+        };
+      } else {
+        markets.push(m);
+      }
+      patch.markets = markets;
+      if (!patch.selected) patch.selected = symbol;
+      break;
+    }
+    case 'session':
+      patch.session = evt.session ? (evt.session as SessionInfo) : null;
+      break;
+    case 'balance':
+      patch.session = state.session ? { ...state.session, balance: Number(evt.balance ?? 0) } : state.session;
+      break;
+    case 'status':
+      patch.automation = evt.state as AutomationState;
+      if (evt.reason) pushLog('info', `automation: ${String(evt.reason)}`);
+      break;
+    case 'signal':
+      patch.signal = { signal: evt.signal as SignalCandidate, phase: String(evt.phase ?? '') };
+      break;
+    case 'quote':
+      patch.quote = evt as QuoteEvt;
+      break;
+    case 'quote_error':
+      patch.quote = null;
+      pushLog('warn', `quote error: ${String(evt.message ?? '')}`);
+      break;
+    case 'decision':
+      patch.decision = {
+        decision: evt.decision as Decision,
+        streak: Number(evt.streak ?? 0),
+        lost: Number(evt.lost ?? 0),
+      };
+      break;
+    case 'hold':
+      patch.hold = { reason: String(evt.reason ?? '') };
+      break;
+    case 'trade': {
+      const t = evt.trade as TradeRow;
+      if (t) patch.trades = [t, ...state.trades.filter((x) => x.id !== t.id)].slice(0, 50);
+      break;
+    }
+    case 'contract': {
+      const c: ContractEvt = {
+        contractId: evt.contractId as string | undefined,
+        result: evt.result as string | undefined,
+        profit: evt.profit as number | undefined,
+        phase: evt.phase as string | undefined,
+        error: evt.error as string | undefined,
+      };
+      patch.contract = c;
+      if (c.result) {
+        if (c.phase !== 'purchased') {
+          pushLog(c.result === 'won' ? 'info' : 'warn', `contract ${c.result} ${c.profit != null ? `(${c.profit})` : ''}`);
+          void refreshTrades();
+        }
+      }
+      break;
+    }
+    case 'recovery': {
+      patch.recovery = evt.recovery as Recovery;
+      if (evt.reset) patch.contract = null;
+      break;
+    }
+    case 'error':
+      pushLog('error', String(evt.message ?? ''));
+      break;
+    case 'log':
+      pushLog(String(evt.level ?? 'info'), String(evt.message ?? ''));
+      break;
+    default:
+      return;
+  }
+  set(patch);
+}
+
+let ws: WebSocket | null = null;
+let wsTimer: number | null = null;
+let retry = 0;
+
+export function connectWs(): void {
+  if (ws) return;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  set({ ws: 'connecting' });
+
+  ws.onopen = () => {
+    retry = 0;
+    set({ ws: 'open' });
+  };
+
+  ws.onmessage = (msg) => {
+    try {
+      applyEvent(JSON.parse(String(msg.data)));
+    } catch {
+      // ignore malformed frames
+    }
+  };
+
+  ws.onclose = () => {
+    ws = null;
+    set({ ws: 'closed' });
+    const delay = Math.min(15000, 1000 * 2 ** retry);
+    retry += 1;
+    if (wsTimer) window.clearTimeout(wsTimer);
+    wsTimer = window.setTimeout(connectWs, delay);
+  };
+
+  ws.onerror = () => {
+    try {
+      ws?.close();
+    } catch {
+      // ignore
+    }
+  };
+}
+
+// ---- actions ----
+
+export async function bootstrap(): Promise<void> {
+  try {
+    const s = (await api('/api/state')) as State;
+    set({
+      feed: s.feed,
+      markets: s.markets,
+      session: s.session,
+      recovery: s.recovery,
+      settings: s.settings,
+      automation: s.automation,
+      trades: s.trades,
+      selected: s.selected ?? s.markets[0]?.symbol ?? null,
+    });
+  } catch (err) {
+    pushLog('error', `state load failed: ${String(err)}`);
+  }
+  connectWs();
+}
+
+export async function connectPat(token: string): Promise<SessionInfo> {
+  const res = await api<{ ok: boolean; session: SessionInfo }>('/api/auth/pat', {
+    method: 'POST',
+    body: JSON.stringify({ token }),
+  });
+  set({ session: res.session });
+  return res.session;
+}
+
+export async function oauthStart(): Promise<string> {
+  const res = await api<{ ok: boolean; url: string }>('/api/auth/oauth/start');
+  if (!res.url) throw new Error('OAuth not configured');
+  return res.url;
+}
+
+export async function logout(): Promise<void> {
+  await api('/api/auth/logout', { method: 'POST' });
+  set({ session: null, automation: null, signal: null, decision: null, hold: null, contract: null });
+}
+
+export async function startAutomation(opts?: {
+  strategyMode?: Settings['strategy_mode'];
+  baseStake?: number;
+  maxTrades?: number;
+}): Promise<void> {
+  try {
+    const body: Record<string, unknown> = {};
+    if (opts?.strategyMode !== undefined) body.strategy_mode = opts.strategyMode;
+    if (opts?.baseStake !== undefined) body.base_stake = opts.baseStake;
+    if (opts?.maxTrades !== undefined) body.max_trades = opts.maxTrades;
+    const res = await api<{ state: AutomationState }>('/api/automation/start', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    set({ automation: res.state });
+    pushLog('info', `automation started${opts?.maxTrades ? ` (${opts.maxTrades} trades)` : ''}`);
+  } catch (err) {
+    pushLog('error', `automation start failed: ${String(err)}`);
+    throw err;
+  }
+}
+
+export async function stopAutomation(): Promise<void> {
+  const res = await api<{ state: AutomationState }>('/api/automation/stop', { method: 'POST' });
+  set({ automation: res.state });
+}
+
+export async function arm(): Promise<void> {
+  await api('/api/automation/arm', { method: 'POST' });
+  pushLog('info', 'real-account automation armed for 10 minutes');
+}
+
+export interface ManualOrder {
+  market: string;
+  direction: 'over' | 'under';
+  barrier: number;
+  stake: number;
+}
+
+export async function manualTrade(order: ManualOrder): Promise<void> {
+  try {
+    const res = await api<{ ok: boolean; trade: unknown }>('/api/trade/manual', {
+      method: 'POST',
+      body: JSON.stringify(order),
+    });
+    if (res.ok) {
+      pushLog('info', `manual trade placed: ${order.market} ${order.direction} @${order.barrier}`);
+    }
+  } catch (err) {
+    pushLog('error', `trade failed: ${String(err)}`);
+    throw err;
+  }
+}
+
+export async function updateSettings(patch: Partial<Settings>): Promise<Settings> {
+  const res = await api<Settings>('/api/settings', {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  });
+  set({ settings: res });
+  return res;
+}
+
+export function selectMarket(symbol: string | null): void {
+  set({ selected: symbol });
+}
+
+export async function clearStuckTrade(): Promise<void> {
+  try {
+    const res = await api<{ ok: boolean; message: string }>('/api/trade/clear-stuck', { method: 'POST' });
+    pushLog('info', res.message);
+  } catch (err) {
+    pushLog('error', `clear stuck trade failed: ${String(err)}`);
+    throw err;
+  }
+}
+
+export async function refreshTrades(limit = 50): Promise<void> {
+  try {
+    const res = await api<{ trades: TradeRow[] }>(`/api/history?limit=${limit}`);
+    if (Array.isArray(res.trades)) set({ trades: res.trades.slice(0, 50) });
+  } catch {
+    // best-effort refresh; stale list is fine
+  }
+}

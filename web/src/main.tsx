@@ -1,0 +1,8 @@
+import { render } from 'preact';
+import { bootstrap } from './store';
+import { App } from './App';
+import './styles.css';
+
+void bootstrap();
+
+render(<App />, document.getElementById('root')!);
